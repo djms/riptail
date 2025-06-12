@@ -13,23 +13,28 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader, SeekFrom};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep};
+use walkdir::WalkDir;
 
 const IDLE_TIME: u64 = 60 * 10; // 10 min without activity
 
-// cargo add tokio --features tokio/full tokio_stream regex clap --features clap/derive notify futures colored anyhow
+// cargo add tokio --features tokio/full tokio_stream walkdir regex clap --features clap/derive notify futures colored anyhow
 #[derive(Parser, Debug)]
 struct Args {
     /// Directory (or glob pattern) to watch
-    #[arg(default_value = ".")]
+    #[arg(value_name = "PATH", required = true)]
     path: Vec<PathBuf>,
     /// Watch directories recursively
     #[arg(short, long)]
     recursive: bool,
+    /// Depth of directory recursion (default 1)
+    #[arg(short, long, default_value_t = 1)]
+    depth: usize,
 }
 
 struct RipTail {
@@ -46,12 +51,9 @@ impl RipTail {
     }
 
     /// Returns true if file is already in the hashset
-    fn _set_file(&self, path: PathBuf) -> bool {
-        let was_new = {
-            let mut set = self.watched_files.lock().unwrap();
-            set.insert(path.clone())
-        };
-        was_new
+    async fn _set_file(&self, path: PathBuf) -> bool {
+        let mut set = self.watched_files.lock().await;
+        set.insert(path)
     }
 
     fn _clone_for_task(&self) -> RipTail {
@@ -61,11 +63,10 @@ impl RipTail {
         }
     }
 
-    fn _watch_file(&self, path: PathBuf) -> Result<()> {
-        dbg!(&path);
+    async fn _watch_file(&self, path: PathBuf) -> Result<()> {
         let path = std::fs::canonicalize(path)?;
         let this = self._clone_for_task();
-        let was_new = this._set_file(path.clone());
+        let was_new = this._set_file(path.clone()).await;
         if was_new {
             let handle = tokio::spawn(async move {
                 if let Err(e) = tail_file(path).await {
@@ -77,28 +78,25 @@ impl RipTail {
         Ok(())
     }
 
-    fn _watch_folder(&self, path: PathBuf, depth: usize) -> Result<()> {
-        if depth == 0 {
-            return Ok(());
-        }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                self._watch_file(path)?;
-            } else if path.is_dir() {
-                self._watch_folder(path.clone(), depth - 1)?;
+    async fn _watch_folder(&self, path: PathBuf, depth: usize) -> Result<()> {
+        for entry in WalkDir::new(&path)
+            .max_depth(depth)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                self._watch_file(entry_path.to_path_buf()).await?;
             }
         }
         Ok(())
     }
 
-    fn watch(&self, path: PathBuf) -> Result<()> {
+    async fn watch(&self, path: PathBuf, depth: usize) -> Result<()> {
         if path.is_file() {
-            self._watch_file(path)?;
+            self._watch_file(path).await?;
         } else if path.is_dir() {
-            self._watch_folder(path, 1)?;
+            self._watch_folder(path, depth).await?;
         }
         Ok(())
     }
@@ -123,11 +121,11 @@ async fn main() -> anyhow::Result<()> {
     for path in paths {
         let mode = [NonRecursive, Recursive][args.recursive as usize];
         watcher.watch(&path, mode)?;
-        rt.watch(path)?;
+        rt.watch(path, args.depth).await?;
     }
 
     while let Some(path) = rx.recv().await {
-        rt.watch(path)?;
+        rt.watch(path, args.depth).await?;
     }
     Ok(())
 }
@@ -143,7 +141,6 @@ async fn tail_file(path: PathBuf) -> Result<()> {
         reader.seek(SeekFrom::Start(byte_offset)).await?;
         buffer.clear();
         let bytes_read = reader.read_until(b'\n', &mut buffer).await?;
-        // dbg!(bytes_read);
         if bytes_read == 0 {
             if to.elapsed() > Duration::from_secs(IDLE_TIME) {
                 break;
